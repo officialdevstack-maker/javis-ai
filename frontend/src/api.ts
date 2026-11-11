@@ -207,6 +207,39 @@ function dispatch(
   }
 }
 
+export async function transcribeAudio(audio: Blob): Promise<string> {
+  const form = new FormData();
+  form.append("audio", audio, "speech.webm");
+  const response = await fetch(apiUrl("/voice/transcribe"), { method: "POST", body: form });
+  if (!response.ok) {
+    const detail = await response.text();
+    throw new Error(
+      detail
+        ? `Backend error (HTTP ${response.status}): ${detail}`
+        : `The backend returned HTTP ${response.status}.`,
+    );
+  }
+  const result = (await response.json()) as { text: string };
+  return result.text;
+}
+
+export async function synthesizeSpeech(text: string): Promise<Blob> {
+  const response = await fetch(apiUrl("/voice/speak"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text }),
+  });
+  if (!response.ok) {
+    const detail = await response.text();
+    throw new Error(
+      detail
+        ? `Backend error (HTTP ${response.status}): ${detail}`
+        : `The backend returned HTTP ${response.status}.`,
+    );
+  }
+  return response.blob();
+}
+
 export async function streamChat(
   conversationId: string,
   messages: ChatMessage[],

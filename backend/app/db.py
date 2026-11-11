@@ -190,6 +190,18 @@ def complete_chat_turn(conversation_id: UUID, content: str) -> None:
         )
 
 
+def discard_unanswered_turn(conversation_id: UUID) -> None:
+    """Delete the trailing user message if no assistant reply followed it."""
+    with _connect() as connection:
+        row = connection.execute(
+            "SELECT id, role FROM messages WHERE conversation_id = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (str(conversation_id),),
+        ).fetchone()
+        if row is not None and row["role"] == "user":
+            connection.execute("DELETE FROM messages WHERE id = ?", (row["id"],))
+
+
 def _source(row: sqlite3.Row) -> IndexedSource:
     return IndexedSource(
         id=row["id"],

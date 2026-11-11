@@ -6,3 +6,6 @@ python-dotenv
 chromadb
 pypdf
 python-docx
+faster-whisper
+piper-tts
+python-multipart

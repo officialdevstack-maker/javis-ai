@@ -196,6 +196,10 @@ def ingest_folder(folder_path: str, scope: Scope) -> IngestResponse:
     embeddings = _embed(chunk_texts) if chunk_texts else []
     collection = _collection()
     try:
+        if indexed_sources:
+            collection.delete(
+                where={"source_id": {"$in": [source.id for source in indexed_sources]}}
+            )
         for offset in range(0, len(chunk_texts), EMBEDDING_BATCH_SIZE):
             collection.upsert(
                 ids=chunk_ids[offset : offset + EMBEDDING_BATCH_SIZE],

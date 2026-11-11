@@ -27,6 +27,7 @@ interface ToolActivity extends ToolCallEvent {
 
 interface ChatProps {
   onOpenSources: () => void;
+  onOpenVoice: () => void;
 }
 
 function updateToolActivity(
@@ -52,7 +53,7 @@ function removeEmptyAssistant(messages: ChatMessage[]): ChatMessage[] {
     : messages;
 }
 
-export default function Chat({ onOpenSources }: ChatProps) {
+export default function Chat({ onOpenSources, onOpenVoice }: ChatProps) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
@@ -107,6 +108,7 @@ export default function Chat({ onOpenSources }: ChatProps) {
     setLoadingConversation(true);
     setConversationId(id);
     setMessages([]);
+    setToolActivities([]);
     setError(null);
     try {
       const conversation = await getConversation(id);
@@ -160,9 +162,7 @@ export default function Chat({ onOpenSources }: ChatProps) {
           onToolResult: (tool: ToolResultEvent) => {
             setToolActivities((current) =>
               updateToolActivity(current, tool.tool_id, {
-                status: tool.result.startsWith("Denied by the user")
-                  ? "denied"
-                  : "complete",
+                status: tool.result.startsWith("Denied") ? "denied" : "complete",
                 result: tool.result,
               }),
             );
@@ -268,6 +268,9 @@ export default function Chat({ onOpenSources }: ChatProps) {
         </a>
         <div className="header-actions">
           <span className="local-indicator"><span /> Local and private</span>
+          <button className="new-chat-button" onClick={onOpenVoice}>
+            Voice
+          </button>
           <button className="new-chat-button" onClick={onOpenSources}>
             Sources
           </button>

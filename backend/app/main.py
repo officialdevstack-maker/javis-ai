@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from uuid import UUID
 
 import httpx
-from fastapi import FastAPI, HTTPException, Response, status
+from fastapi import FastAPI, File, HTTPException, Response, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
@@ -17,6 +17,7 @@ from .db import (
     complete_chat_turn,
     create_conversation,
     delete_conversation,
+    discard_unanswered_turn,
     get_conversation,
     initialize_database,
     list_conversations,
@@ -34,7 +35,10 @@ from .schemas import (
     IngestResponse,
     Message,
     SourcesResponse,
+    SpeakRequest,
+    TranscriptionResponse,
 )
+from .voice import VoiceError, synthesize, transcribe
 
 
 settings = get_settings()
@@ -65,6 +69,7 @@ async def event_stream(
     messages: list[Message],
 ) -> AsyncIterator[str]:
     answer: list[str] = []
+    saved = False
     try:
         async for event in run_agent(messages):
             if event.event == "token":
@@ -74,6 +79,7 @@ async def event_stream(
             yield sse(event.event, event.data)
         if answer:
             await asyncio.to_thread(complete_chat_turn, conversation_id, "".join(answer))
+            saved = True
         yield sse("done", {})
     except AgentError as exc:
         yield sse("error", {"message": str(exc)})
@@ -83,6 +89,15 @@ async def event_stream(
         yield sse("error", {"message": f"Ollama returned invalid JSON: {exc}"})
     except sqlite3.Error as exc:
         yield sse("error", {"message": f"Could not save the assistant reply: {exc}"})
+    finally:
+        if not saved:
+            try:
+                if answer:
+                    complete_chat_turn(conversation_id, "".join(answer))
+                else:
+                    discard_unanswered_turn(conversation_id)
+            except sqlite3.Error:
+                pass
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -160,6 +175,32 @@ async def remove_source(source_id: str) -> Response:
     if source is None:
         raise HTTPException(status_code=404, detail="Source not found")
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+MAX_AUDIO_BYTES = 10 * 1024 * 1024
+
+
+@app.post("/voice/transcribe", response_model=TranscriptionResponse)
+async def voice_transcribe(audio: UploadFile = File(...)) -> TranscriptionResponse:
+    data = await audio.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="The audio upload was empty")
+    if len(data) > MAX_AUDIO_BYTES:
+        raise HTTPException(status_code=413, detail="The audio upload is too large")
+    try:
+        text = await asyncio.to_thread(transcribe, data)
+    except VoiceError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return TranscriptionResponse(text=text)
+
+
+@app.post("/voice/speak")
+async def voice_speak(request: SpeakRequest) -> Response:
+    try:
+        wav = await asyncio.to_thread(synthesize, request.text)
+    except VoiceError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return Response(content=wav, media_type="audio/wav")
 
 
 @app.post("/chat")

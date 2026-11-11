@@ -34,30 +34,58 @@ def resolve_approval(request_id: UUID, approved: bool) -> bool:
     return True
 
 
-async def _chat_with_tools(
+async def _stream_assistant_turn(
     client: httpx.AsyncClient,
     history: list[dict[str, object]],
-) -> dict[str, object]:
+) -> AsyncIterator[tuple[str, object]]:
+    """Yield ("token", text) chunks, then one ("message", assistant_message)."""
     settings = get_settings()
-    response = await client.post(
+    content_parts: list[str] = []
+    tool_calls: list[object] = []
+
+    async with client.stream(
+        "POST",
         f"{settings.ollama_url}/api/chat",
         json={
             "model": settings.model,
             "messages": history,
             "tools": [tool.ollama_schema() for tool in TOOLS.values()],
             "options": {"temperature": 0.1},
-            "stream": False,
+            "stream": True,
         },
-    )
-    if response.status_code != 200:
-        raise AgentError(f"Ollama returned HTTP {response.status_code}: {response.text}")
-    result: object = response.json()
-    if not isinstance(result, dict):
-        raise AgentError("Ollama returned an invalid chat response")
-    message = result.get("message")
-    if not isinstance(message, dict):
-        raise AgentError("Ollama response did not contain a message")
-    return message
+    ) as response:
+        if response.status_code != 200:
+            body = (await response.aread()).decode(errors="replace")
+            raise AgentError(f"Ollama returned HTTP {response.status_code}: {body}")
+
+        async for line in response.aiter_lines():
+            if not line:
+                continue
+            data: object = json.loads(line)
+            if not isinstance(data, dict):
+                raise AgentError("Ollama returned an invalid streaming response")
+            if "error" in data:
+                raise AgentError(str(data["error"]))
+
+            message = data.get("message")
+            if isinstance(message, dict):
+                chunk = message.get("content")
+                if isinstance(chunk, str) and chunk:
+                    content_parts.append(chunk)
+                    yield "token", chunk
+                calls = message.get("tool_calls")
+                if isinstance(calls, list):
+                    tool_calls.extend(calls)
+            if data.get("done") is True:
+                break
+
+    assistant_message: dict[str, object] = {
+        "role": "assistant",
+        "content": "".join(content_parts),
+    }
+    if tool_calls:
+        assistant_message["tool_calls"] = tool_calls
+    yield "message", assistant_message
 
 
 async def run_agent(messages: list[Message]) -> AsyncIterator[AgentEvent]:
@@ -123,7 +151,13 @@ async def run_agent(messages: list[Message]) -> AsyncIterator[AgentEvent]:
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(None, connect=10.0)) as client:
         for _ in range(MAX_TOOL_ITERATIONS):
-            assistant_message = await _chat_with_tools(client, history)
+            assistant_message: dict[str, object] = {}
+            async for kind, payload in _stream_assistant_turn(client, history):
+                if kind == "token" and isinstance(payload, str):
+                    yield AgentEvent("token", {"text": payload})
+                elif kind == "message" and isinstance(payload, dict):
+                    assistant_message = payload
+
             tool_calls = assistant_message.get("tool_calls", [])
             content = assistant_message.get("content", "")
             history.append(assistant_message)
@@ -139,8 +173,7 @@ async def run_agent(messages: list[Message]) -> AsyncIterator[AgentEvent]:
                     ]
                     if missing_citations:
                         citations = ", ".join(f"[{source}]" for source in missing_citations)
-                        content = f"{content}\n\nSources: {citations}"
-                    yield AgentEvent("token", {"text": content})
+                        yield AgentEvent("token", {"text": f"\n\nSources: {citations}"})
                 return
 
             for tool_call in tool_calls:
@@ -154,30 +187,27 @@ async def run_agent(messages: list[Message]) -> AsyncIterator[AgentEvent]:
                 if not isinstance(name, str) or not isinstance(arguments, dict):
                     raise AgentError("Ollama returned invalid tool arguments")
                 tool_id = str(uuid4())
+                yield AgentEvent(
+                    "tool_call",
+                    {"tool_id": tool_id, "name": name, "arguments": arguments},
+                )
                 definition = TOOLS.get(name)
                 if definition is None:
+                    result = "Error: this tool is not available."
                     yield AgentEvent(
                         "tool_result",
                         {
                             "tool_id": tool_id,
                             "name": name,
                             "arguments": arguments,
-                            "result": "Error: this tool is not available.",
+                            "result": result,
                         },
                     )
                     history.append(
-                        {
-                            "role": "tool",
-                            "tool_name": name,
-                            "content": "Error: this tool is not available.",
-                        }
+                        {"role": "tool", "tool_name": name, "content": result}
                     )
                     continue
 
-                yield AgentEvent(
-                    "tool_call",
-                    {"tool_id": tool_id, "name": name, "arguments": arguments},
-                )
                 approval_required = definition.requires_confirmation or (
                     untrusted_context and not definition.is_read_only
                 )
@@ -194,11 +224,21 @@ async def run_agent(messages: list[Message]) -> AsyncIterator[AgentEvent]:
                             "arguments": arguments,
                         },
                     )
+                    timed_out = False
                     try:
-                        approved = await approval_future
+                        approved = await asyncio.wait_for(
+                            approval_future,
+                            timeout=settings.approval_timeout_seconds,
+                        )
+                    except TimeoutError:
+                        approved = False
+                        timed_out = True
                     finally:
                         _pending_approvals.pop(request_id, None)
-                    if not approved:
+
+                    if timed_out:
+                        result = "Denied: approval timed out; no changes were made."
+                    elif not approved:
                         result = "Denied by the user; no changes were made."
                     else:
                         result = await _execute_tool(name, arguments)
@@ -247,7 +287,14 @@ def _requests_knowledge_search(messages: list[Message]) -> bool:
     prompt = messages[-1].content.casefold()
     return any(
         term in prompt
-        for term in ("knowledge", "document", "indexed", "source file", "local file")
+        for term in (
+            "knowledge",
+            "indexed",
+            "my documents",
+            "my docs",
+            "source file",
+            "in my sources",
+        )
     )
 
 

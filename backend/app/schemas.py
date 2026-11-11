@@ -78,3 +78,11 @@ class HealthResponse(BaseModel):
     ollama_reachable: bool
     model: str
     model_available: bool
+
+
+class TranscriptionResponse(BaseModel):
+    text: str
+
+
+class SpeakRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=2000)

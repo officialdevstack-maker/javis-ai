@@ -21,6 +21,10 @@ class Settings(BaseSettings):
     system_prompt: str
     embedding_model: str
     chroma_path: Path
+    whisper_model: str = "base.en"
+    whisper_language: str = "en"
+    piper_voice_path: Path = Path("data/voices/en_GB-alan-medium.onnx")
+    approval_timeout_seconds: int = 300
 
     @field_validator("ollama_url")
     @classmethod
@@ -52,6 +56,12 @@ class Settings(BaseSettings):
         if self.chroma_path.is_absolute():
             return self.chroma_path
         return (Path(__file__).resolve().parents[1] / self.chroma_path).resolve()
+
+    @property
+    def resolved_piper_voice_path(self) -> Path:
+        if self.piper_voice_path.is_absolute():
+            return self.piper_voice_path
+        return (Path(__file__).resolve().parents[1] / self.piper_voice_path).resolve()
 
     @property
     def resolved_allowed_dirs(self) -> list[Path]:
