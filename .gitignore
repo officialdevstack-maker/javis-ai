@@ -1,0 +1,8 @@
+.env
+venv/
+node_modules/
+data/
+chroma/
+__pycache__/
+.pytest_cache/
+dist/

@@ -1,0 +1,279 @@
+from collections.abc import Iterator
+from contextlib import contextmanager
+import sqlite3
+from datetime import UTC, datetime
+from uuid import UUID, uuid4
+
+from .config import get_settings
+from .schemas import (
+    ConversationDetail,
+    ConversationSummary,
+    IndexedSource,
+    Message,
+    Scope,
+    StoredMessage,
+)
+
+
+NEW_CONVERSATION_TITLE = "New chat"
+
+@contextmanager
+def _connect() -> Iterator[sqlite3.Connection]:
+    database_path = get_settings().resolved_database_path
+    database_path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(database_path, timeout=10)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute("PRAGMA busy_timeout = 10000")
+    try:
+        yield connection
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def _now() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def initialize_database() -> None:
+    with _connect() as connection:
+        connection.execute("PRAGMA journal_mode = WAL")
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS conversations (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_messages_conversation
+                ON messages(conversation_id, id);
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS sources (
+                id TEXT PRIMARY KEY,
+                path TEXT NOT NULL,
+                folder_path TEXT NOT NULL,
+                source TEXT NOT NULL,
+                scope TEXT NOT NULL CHECK (scope IN ('private', 'public', 'business')),
+                indexed_at TEXT NOT NULL,
+                chunk_count INTEGER NOT NULL CHECK (chunk_count >= 0),
+                UNIQUE (path, scope)
+            );
+            CREATE INDEX IF NOT EXISTS idx_sources_folder_scope
+                ON sources(folder_path, scope);
+            """
+        )
+
+
+def _summary(row: sqlite3.Row) -> ConversationSummary:
+    return ConversationSummary(
+        id=UUID(row["id"]),
+        title=row["title"],
+        created_at=datetime.fromisoformat(row["created_at"]),
+        updated_at=datetime.fromisoformat(row["updated_at"]),
+    )
+
+
+def create_conversation() -> ConversationSummary:
+    conversation_id = uuid4()
+    now = _now()
+    with _connect() as connection:
+        connection.execute(
+            "INSERT INTO conversations (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
+            (str(conversation_id), NEW_CONVERSATION_TITLE, now, now),
+        )
+        row = connection.execute(
+            "SELECT * FROM conversations WHERE id = ?", (str(conversation_id),)
+        ).fetchone()
+    if row is None:
+        raise RuntimeError("The new conversation was not persisted")
+    return _summary(row)
+
+
+def list_conversations() -> list[ConversationSummary]:
+    with _connect() as connection:
+        rows = connection.execute(
+            "SELECT * FROM conversations ORDER BY updated_at DESC, id DESC"
+        ).fetchall()
+    return [_summary(row) for row in rows]
+
+
+def get_conversation(conversation_id: UUID) -> ConversationDetail | None:
+    with _connect() as connection:
+        row = connection.execute(
+            "SELECT * FROM conversations WHERE id = ?", (str(conversation_id),)
+        ).fetchone()
+        if row is None:
+            return None
+        message_rows = connection.execute(
+            "SELECT id, role, content, created_at FROM messages "
+            "WHERE conversation_id = ? ORDER BY id",
+            (str(conversation_id),),
+        ).fetchall()
+    return ConversationDetail(
+        **_summary(row).model_dump(),
+        messages=[
+            StoredMessage(
+                id=message["id"],
+                role=message["role"],
+                content=message["content"],
+                created_at=datetime.fromisoformat(message["created_at"]),
+            )
+            for message in message_rows
+        ],
+    )
+
+
+def delete_conversation(conversation_id: UUID) -> bool:
+    with _connect() as connection:
+        cursor = connection.execute(
+            "DELETE FROM conversations WHERE id = ?", (str(conversation_id),)
+        )
+    return cursor.rowcount > 0
+
+
+def begin_chat_turn(conversation_id: UUID, message: Message) -> list[Message] | None:
+    now = _now()
+    with _connect() as connection:
+        row = connection.execute(
+            "SELECT title FROM conversations WHERE id = ?", (str(conversation_id),)
+        ).fetchone()
+        if row is None:
+            return None
+        if row["title"] == NEW_CONVERSATION_TITLE:
+            title = message.content.strip().splitlines()[0][:80] or NEW_CONVERSATION_TITLE
+            connection.execute(
+                "UPDATE conversations SET title = ? WHERE id = ?",
+                (title, str(conversation_id)),
+            )
+        connection.execute(
+            "INSERT INTO messages (conversation_id, role, content, created_at) "
+            "VALUES (?, 'user', ?, ?)",
+            (str(conversation_id), message.content, now),
+        )
+        connection.execute(
+            "UPDATE conversations SET updated_at = ? WHERE id = ?",
+            (now, str(conversation_id)),
+        )
+        rows = connection.execute(
+            "SELECT role, content FROM messages WHERE conversation_id = ? ORDER BY id",
+            (str(conversation_id),),
+        ).fetchall()
+    return [Message(role=row["role"], content=row["content"]) for row in rows]
+
+
+def complete_chat_turn(conversation_id: UUID, content: str) -> None:
+    now = _now()
+    with _connect() as connection:
+        connection.execute(
+            "INSERT INTO messages (conversation_id, role, content, created_at) "
+            "VALUES (?, 'assistant', ?, ?)",
+            (str(conversation_id), content, now),
+        )
+        connection.execute(
+            "UPDATE conversations SET updated_at = ? WHERE id = ?",
+            (now, str(conversation_id)),
+        )
+
+
+def _source(row: sqlite3.Row) -> IndexedSource:
+    return IndexedSource(
+        id=row["id"],
+        path=row["path"],
+        folder_path=row["folder_path"],
+        source=row["source"],
+        scope=row["scope"],
+        indexed_at=datetime.fromisoformat(row["indexed_at"]),
+        chunk_count=row["chunk_count"],
+    )
+
+
+def list_sources(
+    *,
+    folder_path: str | None = None,
+    scope: Scope | None = None,
+) -> list[IndexedSource]:
+    clauses: list[str] = []
+    values: list[str] = []
+    if folder_path is not None:
+        clauses.append("folder_path = ?")
+        values.append(folder_path)
+    if scope is not None:
+        clauses.append("scope = ?")
+        values.append(scope)
+    where_clause = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    with _connect() as connection:
+        rows = connection.execute(
+            f"SELECT * FROM sources{where_clause} ORDER BY indexed_at DESC, source",
+            values,
+        ).fetchall()
+    return [_source(row) for row in rows]
+
+
+def get_source(source_id: str) -> IndexedSource | None:
+    with _connect() as connection:
+        row = connection.execute("SELECT * FROM sources WHERE id = ?", (source_id,)).fetchone()
+    return _source(row) if row is not None else None
+
+
+def replace_folder_sources(
+    folder_path: str,
+    scope: Scope,
+    sources: list[IndexedSource],
+) -> list[str]:
+    now = _now()
+    with _connect() as connection:
+        old_ids = [
+            row["id"]
+            for row in connection.execute(
+                "SELECT id FROM sources WHERE folder_path = ? AND scope = ?",
+                (folder_path, scope),
+            ).fetchall()
+        ]
+        new_ids = {source.id for source in sources}
+        connection.execute(
+            "DELETE FROM sources WHERE folder_path = ? AND scope = ?",
+            (folder_path, scope),
+        )
+        connection.executemany(
+            "INSERT INTO sources "
+            "(id, path, folder_path, source, scope, indexed_at, chunk_count) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    source.id,
+                    source.path,
+                    source.folder_path,
+                    source.source,
+                    source.scope,
+                    now,
+                    source.chunk_count,
+                )
+                for source in sources
+            ],
+        )
+    return [source_id for source_id in old_ids if source_id not in new_ids]
+
+
+def delete_source_record(source_id: str) -> IndexedSource | None:
+    with _connect() as connection:
+        row = connection.execute("SELECT * FROM sources WHERE id = ?", (source_id,)).fetchone()
+        if row is None:
+            return None
+        source = _source(row)
+        connection.execute("DELETE FROM sources WHERE id = ?", (source_id,))
+    return source
