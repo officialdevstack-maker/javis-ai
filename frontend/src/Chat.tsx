@@ -5,14 +5,18 @@ import {
   confirmToolCall,
   createConversation,
   deleteConversation,
+  deleteMemory,
   getConversation,
   listConversations,
+  listMemories,
   streamChat,
 } from "./api";
 import type {
   ChatMessage,
   ConfirmationEvent,
   ConversationSummary,
+  MemoryItem,
+  Scope,
   ToolCallEvent,
   ToolResultEvent,
 } from "./api";
@@ -28,6 +32,7 @@ interface ToolActivity extends ToolCallEvent {
 interface ChatProps {
   onOpenSources: () => void;
   onOpenVoice: () => void;
+  onOpenSafety: () => void;
 }
 
 function updateToolActivity(
@@ -53,13 +58,15 @@ function removeEmptyAssistant(messages: ChatMessage[]): ChatMessage[] {
     : messages;
 }
 
-export default function Chat({ onOpenSources, onOpenVoice }: ChatProps) {
+export default function Chat({ onOpenSources, onOpenVoice, onOpenSafety }: ChatProps) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [conversationId, setConversationId] = useState<string | null>(null);
+  const [scope, setScope] = useState<Scope>("private");
+  const [memories, setMemories] = useState<MemoryItem[]>([]);
   const [loadingConversation, setLoadingConversation] = useState(true);
   const [toolActivities, setToolActivities] = useState<ToolActivity[]>([]);
   const [confirmingToolId, setConfirmingToolId] = useState<string | null>(null);
@@ -76,9 +83,10 @@ export default function Chat({ onOpenSources, onOpenVoice }: ChatProps) {
     let active = true;
     async function loadHistory(): Promise<void> {
       try {
-        const history = await listConversations();
+        const [history, memoryItems] = await Promise.all([listConversations(scope), listMemories(scope)]);
         if (!active) return;
         setConversations(history);
+        setMemories(memoryItems);
         const mostRecent = history[0];
         if (mostRecent) {
           const conversation = await getConversation(mostRecent.id);
@@ -86,6 +94,9 @@ export default function Chat({ onOpenSources, onOpenVoice }: ChatProps) {
           setConversationId(conversation.id);
           setMessages(conversation.messages);
           setToolActivities([]);
+        } else {
+          setConversationId(null);
+          setMessages([]);
         }
       } catch (loadError: unknown) {
         if (active) {
@@ -100,7 +111,7 @@ export default function Chat({ onOpenSources, onOpenVoice }: ChatProps) {
     return () => {
       active = false;
     };
-  }, []);
+  }, [scope]);
 
   async function openConversation(id: string): Promise<void> {
     if (streaming || loadingConversation) return;
@@ -134,7 +145,7 @@ export default function Chat({ onOpenSources, onOpenVoice }: ChatProps) {
     setError(null);
 
     try {
-      const activeConversation = conversationId ?? (await createConversation()).id;
+      const activeConversation = conversationId ?? (await createConversation(scope)).id;
       if (!conversationId) {
         setConversationId(activeConversation);
       }
@@ -195,7 +206,7 @@ export default function Chat({ onOpenSources, onOpenVoice }: ChatProps) {
     setError(null);
     setLoadingConversation(true);
     try {
-      const conversation = await createConversation();
+      const conversation = await createConversation(scope);
       setConversations((current) => [conversation, ...current]);
       setConversationId(conversation.id);
       setMessages([]);
@@ -212,7 +223,7 @@ export default function Chat({ onOpenSources, onOpenVoice }: ChatProps) {
     if (!window.confirm(`Delete "${title}" and all its messages? This cannot be undone.`)) return;
     try {
       await deleteConversation(id);
-      const remaining = await listConversations();
+      const remaining = await listConversations(scope);
       setConversations(remaining);
       if (conversationId === id) {
         ++selectionRequest.current;
@@ -222,6 +233,15 @@ export default function Chat({ onOpenSources, onOpenVoice }: ChatProps) {
       }
     } catch (deleteError: unknown) {
       setError(deleteError instanceof Error ? deleteError.message : "Could not delete this conversation.");
+    }
+  }
+
+  async function removeMemory(memoryId: number): Promise<void> {
+    try {
+      await deleteMemory(memoryId);
+      setMemories((current) => current.filter((memory) => memory.id !== memoryId));
+    } catch (deleteError: unknown) {
+      setError(deleteError instanceof Error ? deleteError.message : "Could not delete this memory.");
     }
   }
 
@@ -267,12 +287,27 @@ export default function Chat({ onOpenSources, onOpenVoice }: ChatProps) {
           <span>javis<span className="brand-ai">.ai</span></span>
         </a>
         <div className="header-actions">
+          <label className="scope-picker" aria-label="Select active scope">
+            <span>Scope</span>
+            <select
+              value={scope}
+              onChange={(event) => setScope(event.target.value as Scope)}
+              aria-label="Scope"
+            >
+              <option value="private">Private</option>
+              <option value="public">Public</option>
+              <option value="business">Business</option>
+            </select>
+          </label>
           <span className="local-indicator"><span /> Local and private</span>
           <button className="new-chat-button" onClick={onOpenVoice}>
             Voice
           </button>
           <button className="new-chat-button" onClick={onOpenSources}>
             Sources
+          </button>
+          <button className="new-chat-button" onClick={onOpenSafety}>
+            Safety
           </button>
           <button className="new-chat-button" onClick={() => void startNewChat()} disabled={streaming || loadingConversation}>
             <span aria-hidden="true">+</span> New chat
@@ -314,6 +349,29 @@ export default function Chat({ onOpenSources, onOpenVoice }: ChatProps) {
             ))}
             {!loadingConversation && conversations.length === 0 && (
               <p className="no-conversations">Your conversations will appear here.</p>
+            )}
+          </div>
+          <div className="memory-panel">
+            <p className="sidebar-heading">MEMORIES</p>
+            {memories.length === 0 ? (
+              <p className="no-memories">No saved memories in {scope}.</p>
+            ) : (
+              <ul className="memory-list">
+                {memories.map((memory) => (
+                  <li key={memory.id} className="memory-item">
+                    <span>{memory.text}</span>
+                    <button
+                      type="button"
+                      className="memory-delete"
+                      onClick={() => void removeMemory(memory.id)}
+                      aria-label={`Delete memory ${memory.id}`}
+                      title="Delete memory"
+                    >
+                      ×
+                    </button>
+                  </li>
+                ))}
+              </ul>
             )}
           </div>
           <div className="sidebar-footer">

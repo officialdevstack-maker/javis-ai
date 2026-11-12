@@ -8,6 +8,7 @@ export interface ChatMessage {
 export interface ConversationSummary {
   id: string;
   title: string;
+  scope: Scope;
   created_at: string;
   updated_at: string;
 }
@@ -17,6 +18,40 @@ export interface Conversation extends ConversationSummary {
 }
 
 export type Scope = "private" | "public" | "business";
+
+export interface MemoryItem {
+  id: number;
+  text: string;
+  scope: Scope;
+  created_at: string;
+}
+
+export interface ToolPolicy {
+  name: string;
+  tier: 0 | 1 | 2 | 3;
+  requires_confirmation: boolean;
+  is_read_only: boolean;
+  tier3_opt_in: boolean;
+  tier3_limits: Record<string, unknown> | null;
+}
+
+export interface AutonomyStatus {
+  kill_switch_enabled: boolean;
+  tools: ToolPolicy[];
+}
+
+export interface AuditEntry {
+  id: number;
+  tool_name: string;
+  scope: Scope;
+  tier: 0 | 1 | 2 | 3;
+  arguments: Record<string, unknown>;
+  result: string | null;
+  status: "running" | "completed" | "denied" | "blocked" | "error";
+  approval_by: string | null;
+  created_at: string;
+  completed_at: string | null;
+}
 
 export interface IndexedSource {
   id: string;
@@ -83,12 +118,17 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return (await response.json()) as T;
 }
 
-export function listConversations(): Promise<ConversationSummary[]> {
-  return request<ConversationSummary[]>("/conversations");
+export function listConversations(scope?: Scope): Promise<ConversationSummary[]> {
+  const search = scope ? `?scope=${encodeURIComponent(scope)}` : "";
+  return request<ConversationSummary[]>(`/conversations${search}`);
 }
 
-export function createConversation(): Promise<ConversationSummary> {
-  return request<ConversationSummary>("/conversations", { method: "POST" });
+export function createConversation(scope: Scope = "private"): Promise<ConversationSummary> {
+  return request<ConversationSummary>("/conversations", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ scope }),
+  });
 }
 
 export function getConversation(id: string): Promise<Conversation> {
@@ -107,6 +147,54 @@ export async function deleteConversation(id: string): Promise<void> {
         : `The backend returned HTTP ${response.status}.`,
     );
   }
+}
+
+export function listMemories(scope: Scope = "private"): Promise<MemoryItem[]> {
+  return request<MemoryItem[]>(`/memories?scope=${encodeURIComponent(scope)}`);
+}
+
+export function createMemory(fact: string, scope: Scope = "private"): Promise<MemoryItem> {
+  return request<MemoryItem>("/memories", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text: fact, scope }),
+  });
+}
+
+export async function deleteMemory(id: number): Promise<void> {
+  const response = await fetch(apiUrl(`/memories/${encodeURIComponent(String(id))}`), {
+    method: "DELETE",
+  });
+  if (!response.ok) {
+    const detail = await response.text();
+    throw new Error(
+      detail
+        ? `Backend error (HTTP ${response.status}): ${detail}`
+        : `The backend returned HTTP ${response.status}.`,
+    );
+  }
+}
+
+export function getAutonomyStatus(): Promise<AutonomyStatus> {
+  return request<AutonomyStatus>("/autonomy");
+}
+
+export function updateKillSwitch(enabled: boolean): Promise<AutonomyStatus> {
+  return request<AutonomyStatus>("/autonomy/kill-switch", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ enabled }),
+  });
+}
+
+export function getAuditLog(
+  scope?: Scope,
+  toolName?: string,
+): Promise<AuditEntry[]> {
+  const search = new URLSearchParams({ limit: "200" });
+  if (scope) search.set("scope", scope);
+  if (toolName) search.set("tool_name", toolName);
+  return request<AuditEntry[]>(`/audit?${search.toString()}`);
 }
 
 export function getSources(): Promise<{ sources: IndexedSource[] }> {

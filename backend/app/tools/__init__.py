@@ -1,11 +1,14 @@
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
+import math
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from ..config import get_settings
+from ..memory import add_memory, recall
+from ..scopes import active_scope
 from ..schemas import Scope
 
 
@@ -32,7 +35,14 @@ class SaveNoteArguments(ToolArguments):
 
 class SearchKnowledgeArguments(ToolArguments):
     query: str = Field(min_length=1, max_length=500)
-    scope: Scope = "private"
+
+
+class RememberArguments(ToolArguments):
+    fact: str = Field(min_length=1, max_length=2000)
+
+
+class RecallArguments(ToolArguments):
+    query: str = Field(min_length=1, max_length=500)
 
 
 ToolFunction = Callable[[ToolArguments], str]
@@ -44,8 +54,57 @@ class ToolDefinition:
     description: str
     arguments_model: type[ToolArguments]
     function: ToolFunction
+    tier: int = 2
     requires_confirmation: bool = True
     is_read_only: bool = False
+    private_only: bool = False
+    returns_untrusted_data: bool = False
+    tier3_opt_in: bool = False
+    tier3_limits: dict[str, object] | None = None
+
+    def __post_init__(self) -> None:
+        if self.tier not in (0, 1, 2, 3):
+            raise ValueError(f"Invalid autonomy tier for tool {self.name!r}")
+        if self.tier == 0 and not self.is_read_only:
+            raise ValueError(f"Tier 0 tool {self.name!r} must be read-only")
+        if self.tier == 3 and (not self.tier3_opt_in or not self.tier3_limits):
+            raise ValueError(
+                f"Tier 3 tool {self.name!r} requires explicit opt-in and limits"
+            )
+        if self.tier3_opt_in and self.tier != 3:
+            raise ValueError(f"Tier 3 opt-in is only valid for tier 3 tool {self.name!r}")
+        if self.tier == 3:
+            limits = self.tier3_limits or {}
+            required = {
+                "max_amount",
+                "max_recipients",
+                "rate_limit_per_hour",
+                "allowed_domains",
+            }
+            if required - limits.keys():
+                raise ValueError(
+                    f"Tier 3 tool {self.name!r} must configure all safety limits"
+                )
+            max_amount = limits["max_amount"]
+            max_recipients = limits["max_recipients"]
+            rate_limit = limits["rate_limit_per_hour"]
+            domains = limits["allowed_domains"]
+            if (
+                isinstance(max_amount, bool)
+                or not isinstance(max_amount, (int, float))
+                or not math.isfinite(max_amount)
+                or max_amount <= 0
+                or isinstance(max_recipients, bool)
+                or not isinstance(max_recipients, int)
+                or max_recipients <= 0
+                or isinstance(rate_limit, bool)
+                or not isinstance(rate_limit, int)
+                or rate_limit <= 0
+                or not isinstance(domains, list)
+                or not domains
+                or not all(isinstance(domain, str) and domain.strip() for domain in domains)
+            ):
+                raise ValueError(f"Tier 3 tool {self.name!r} has invalid safety limits")
 
     def ollama_schema(self) -> dict[str, object]:
         schema = self.arguments_model.model_json_schema()
@@ -236,9 +295,32 @@ def search_knowledge_tool(arguments: ToolArguments) -> str:
     from ..rag import RAGError, search_knowledge
 
     try:
-        return search_knowledge(arguments.query, arguments.scope)
+        return search_knowledge(arguments.query, active_scope.get())
     except RAGError as exc:
         raise ToolError(str(exc)) from exc
+
+
+def remember_tool(arguments: ToolArguments) -> str:
+    if not isinstance(arguments, RememberArguments):
+        raise ToolError("Invalid arguments for remember.")
+    scope = active_scope.get()
+    item = add_memory(" ".join(arguments.fact.split()), scope)
+    return f"Remembered in the {scope} scope: {item.text}"
+
+
+def recall_tool(arguments: ToolArguments) -> str:
+    if not isinstance(arguments, RecallArguments):
+        raise ToolError("Invalid arguments for recall.")
+    matches = recall(arguments.query, active_scope.get())
+    if not matches:
+        return "No saved memories matched this query."
+    return "\n".join(f"- {item.text}" for item in matches)
+
+
+def tools_for_scope(scope: Scope) -> dict[str, ToolDefinition]:
+    return {
+        name: tool for name, tool in TOOLS.items() if scope == "private" or not tool.private_only
+    }
 
 
 class EmptyArguments(ToolArguments):
@@ -253,36 +335,48 @@ TOOLS: dict[str, ToolDefinition] = {
             description="Read a plain-text file inside an allowed folder.",
             arguments_model=PathArguments,
             function=read_file,
+            tier=0,
             requires_confirmation=False,
             is_read_only=True,
+            private_only=True,
+            returns_untrusted_data=True,
         ),
         ToolDefinition(
             name="list_directory",
             description="List entries in a directory inside an allowed folder.",
             arguments_model=PathArguments,
             function=list_directory,
+            tier=0,
             requires_confirmation=False,
             is_read_only=True,
+            private_only=True,
+            returns_untrusted_data=True,
         ),
         ToolDefinition(
             name="search_notes",
             description="Search allowed text and Markdown notes for a phrase.",
             arguments_model=SearchNotesArguments,
             function=search_notes,
+            tier=0,
             requires_confirmation=False,
             is_read_only=True,
+            private_only=True,
+            returns_untrusted_data=True,
         ),
         ToolDefinition(
             name="save_note",
             description="Save or overwrite a text or Markdown note in an allowed folder. Always requires user approval.",
             arguments_model=SaveNoteArguments,
             function=save_note,
+            tier=2,
+            private_only=True,
         ),
         ToolDefinition(
             name="get_datetime",
             description="Get the current local date and time.",
             arguments_model=EmptyArguments,
             function=get_datetime,
+            tier=0,
             requires_confirmation=False,
             is_read_only=True,
         ),
@@ -294,8 +388,11 @@ TOOLS: dict[str, ToolDefinition] = {
             ),
             arguments_model=EmptyArguments,
             function=read_latest_note,
+            tier=0,
             requires_confirmation=False,
             is_read_only=True,
+            private_only=True,
+            returns_untrusted_data=True,
         ),
         ToolDefinition(
             name="search_knowledge",
@@ -305,8 +402,27 @@ TOOLS: dict[str, ToolDefinition] = {
             ),
             arguments_model=SearchKnowledgeArguments,
             function=search_knowledge_tool,
+            tier=0,
             requires_confirmation=False,
             is_read_only=True,
+            returns_untrusted_data=True,
+        ),
+        ToolDefinition(
+            name="remember",
+            description="Save a long-term fact about the user. Always requires user approval.",
+            arguments_model=RememberArguments,
+            function=remember_tool,
+            tier=2,
+        ),
+        ToolDefinition(
+            name="recall",
+            description="Search saved long-term facts about the user.",
+            arguments_model=RecallArguments,
+            function=recall_tool,
+            tier=0,
+            requires_confirmation=False,
+            is_read_only=True,
+            returns_untrusted_data=True,
         ),
     )
 }

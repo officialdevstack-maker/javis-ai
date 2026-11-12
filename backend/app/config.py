@@ -1,6 +1,7 @@
 from functools import lru_cache
 from ipaddress import ip_address
 from pathlib import Path
+from typing import Literal
 from urllib.parse import urlsplit
 
 from pydantic import field_validator
@@ -15,6 +16,9 @@ class Settings(BaseSettings):
 
     ollama_url: str
     model: str
+    chat_model: str | None = None
+    planning_model: str | None = None
+    code_model: str | None = None
     cors_origins: str
     database_path: Path
     allowed_dirs: str
@@ -76,6 +80,14 @@ class Settings(BaseSettings):
                 directory = backend_dir / directory
             directories.append(directory.resolve())
         return directories
+
+    def model_for_task(self, task: Literal["chat", "planning", "code"]) -> str:
+        configured = {
+            "chat": self.chat_model,
+            "planning": self.planning_model,
+            "code": self.code_model,
+        }[task]
+        return configured or self.model
 
 
 @lru_cache
